@@ -41,9 +41,9 @@ function App() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const unlistenRef = useRef<UnlistenFn | null>(null);
   const streamBufferRef = useRef<string>("");
-  const isActiveStreamRef = useRef<boolean>(false);
+  const activeStreamIdRef = useRef<string | null>(null);
+  const eventListenerRef = useRef<UnlistenFn | null>(null);
 
   // Auto-scroll to bottom
   const scrollToBottom = () => {
@@ -54,22 +54,38 @@ function App() {
     scrollToBottom();
   }, [messages, currentStreamingMessage]);
 
-  // Initialize event listener on mount
+  // Set up event listener once on mount
   useEffect(() => {
+    let isMounted = true;
     let unlisten: UnlistenFn | null = null;
 
-    const initListener = async () => {
+    const setupListener = async () => {
+      // Make sure we don't have duplicate listeners
+      if (eventListenerRef.current) {
+        await eventListenerRef.current();
+        eventListenerRef.current = null;
+      }
+
       try {
         unlisten = await listen<StreamChunk>("stream-chunk", (event) => {
+          if (!isMounted) return;
+
           const chunk = event.payload;
 
+          // Generate a stream ID if this is the first chunk of a new stream
+          if (chunk.type === "chunk" && !activeStreamIdRef.current) {
+            activeStreamIdRef.current = Date.now().toString();
+            streamBufferRef.current = "";
+            console.log("New stream started:", activeStreamIdRef.current);
+          }
+
           // Only process if we have an active stream
-          if (!isActiveStreamRef.current) {
+          if (!activeStreamIdRef.current) {
             console.log("Ignoring chunk - no active stream");
             return;
           }
 
-          console.log("Processing chunk:", chunk);
+          console.log("Processing chunk:", chunk.type, chunk.content);
 
           switch (chunk.type) {
             case "chunk":
@@ -80,6 +96,8 @@ function App() {
               break;
 
             case "complete":
+              console.log("Stream complete, buffer:", streamBufferRef.current);
+
               // Move buffered content to messages
               if (streamBufferRef.current) {
                 const finalMessage: ChatMessage = {
@@ -93,12 +111,13 @@ function App() {
               // Clean up streaming state
               streamBufferRef.current = "";
               setCurrentStreamingMessage("");
-              isActiveStreamRef.current = false;
+              activeStreamIdRef.current = null;
               setLoading(false);
-              console.log("Stream completed");
               break;
 
             case "error":
+              console.error("Stream error:", chunk.error);
+
               const errorMessage: ChatMessage = {
                 role: "error",
                 content: chunk.error || "Streaming error occurred",
@@ -109,31 +128,37 @@ function App() {
               // Clean up streaming state
               streamBufferRef.current = "";
               setCurrentStreamingMessage("");
-              isActiveStreamRef.current = false;
+              activeStreamIdRef.current = null;
               setLoading(false);
-              console.log("Stream error:", chunk.error);
               break;
           }
         });
 
-        unlistenRef.current = unlisten;
-        console.log("Stream listener initialized");
+        eventListenerRef.current = unlisten;
+        console.log("Event listener setup complete");
       } catch (error) {
-        console.error("Failed to setup stream listener:", error);
+        console.error("Failed to setup event listener:", error);
       }
     };
 
-    initListener();
+    // Small delay to ensure Tauri is ready
+    setTimeout(() => {
+      setupListener();
+    }, 100);
 
     return () => {
+      isMounted = false;
       if (unlisten) {
         unlisten();
-        console.log("Stream listener cleaned up");
       }
-      isActiveStreamRef.current = false;
+      if (eventListenerRef.current) {
+        eventListenerRef.current();
+        eventListenerRef.current = null;
+      }
+      activeStreamIdRef.current = null;
       streamBufferRef.current = "";
     };
-  }, []);
+  }, []); // Only run once on mount
 
   // Check system status
   useEffect(() => {
@@ -210,20 +235,25 @@ function App() {
 
     if (streamingMode) {
       try {
-        // Initialize streaming state
-        console.log("Starting new stream for:", currentMessage);
+        // Clear any previous stream state
+        console.log("Clearing previous stream state");
+        activeStreamIdRef.current = null;
         streamBufferRef.current = "";
         setCurrentStreamingMessage("");
-        isActiveStreamRef.current = true;
+
+        // Small delay to ensure state is cleared
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        console.log("Sending stream request for:", currentMessage);
 
         // Start streaming
         await invoke("send_to_python_stream", {
           message: currentMessage.trim(),
         });
 
-        console.log("Stream request sent");
+        console.log("Stream request sent successfully");
       } catch (error) {
-        console.error("Stream error:", error);
+        console.error("Stream request failed:", error);
 
         const errorMessage: ChatMessage = {
           role: "error",
@@ -233,9 +263,9 @@ function App() {
         setMessages((prev) => [...prev, errorMessage]);
 
         // Clean up
+        activeStreamIdRef.current = null;
         streamBufferRef.current = "";
         setCurrentStreamingMessage("");
-        isActiveStreamRef.current = false;
         setLoading(false);
       }
     } else {
@@ -309,17 +339,21 @@ function App() {
 
   const clearChat = () => {
     if (window.confirm("Are you sure you want to clear the chat history?")) {
-      setMessages([]);
-      setCurrentStreamingMessage("");
+      // Clean up any active stream first
+      activeStreamIdRef.current = null;
       streamBufferRef.current = "";
-      isActiveStreamRef.current = false;
+      setCurrentStreamingMessage("");
+
+      // Then clear messages
+      setMessages([]);
       setMessage("");
+      setLoading(false);
       inputRef.current?.focus();
     }
   };
 
   const toggleStreamingMode = () => {
-    if (!loading && !isActiveStreamRef.current) {
+    if (!loading && !activeStreamIdRef.current) {
       setStreamingMode(!streamingMode);
     }
   };
@@ -345,7 +379,7 @@ function App() {
                 type="checkbox"
                 checked={streamingMode}
                 onChange={toggleStreamingMode}
-                disabled={loading || isActiveStreamRef.current}
+                disabled={loading || !!activeStreamIdRef.current}
               />
               <span className="toggle-slider"></span>
               <span className="toggle-text">
@@ -444,7 +478,7 @@ function App() {
         )}
 
         {/* Loading state */}
-        {loading && !currentStreamingMessage && (
+        {loading && !currentStreamingMessage && !activeStreamIdRef.current && (
           <div className="message-wrapper assistant">
             <div className="message message-assistant loading">
               <div className="typing-indicator">
